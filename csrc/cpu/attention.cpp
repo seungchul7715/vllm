@@ -766,3 +766,297 @@ void paged_attention_v2(
                                  CPU_KERNEL_GUARD_OUT(paged_attention_v2_impl)
                                });
 }
+
+//////////
+
+// cache_and_decode
+namespace {
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
+struct cache_and_decode_impl {
+  static void call(
+      scalar_t* __restrict__ out,  // [num_seqs, num_heads, head_size]
+
+      const scalar_t* __restrict__ q,  // [num_seqs, num_heads, head_size]
+      const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+      const int64_t* __restrict__ slot_mapping, const int num_tokens,
+      const int key_stride, const int value_stride, const int num_heads,
+      const int head_size, const int block_size, const int x,
+
+      scalar_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads,
+                                       // head_size/x, block_size, x]
+      scalar_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads,
+                                       // head_size, block_size]
+      const int num_kv_heads, const float scale,
+      const int* __restrict__ block_tables,  // [num_seqs,
+                                             // max_num_blocks_per_seq]
+      const int* __restrict__ seq_lens,      // [num_seqs]
+      const int max_num_blocks_per_seq,
+      const float* __restrict__ alibi_slopes,  // [num_heads]
+      const int q_stride, const int kv_block_stride, const int kv_head_stride,
+      const int num_seqs) {
+    const int block_elem_num = num_heads * head_size * block_size;
+#pragma omp parallel for collapse(2)
+    for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
+        const int64_t slot_idx = slot_mapping[token_idx];
+        if (slot_idx >= 0) {
+          int src_key_head_idx = token_idx * key_stride + head_idx * head_size;
+          int src_value_head_idx =
+              token_idx * value_stride + head_idx * head_size;
+          const scalar_t* src_key_head_ptr = k + src_key_head_idx;
+          const scalar_t* src_value_head_ptr = v + src_value_head_idx;
+          const int64_t block_index = slot_idx / block_size;
+          const int64_t block_offset = slot_idx % block_size;
+          scalar_t* target_key_head_ptr = k_cache +
+                                          block_elem_num * block_index +
+                                          head_idx * block_size * head_size;
+          scalar_t* target_value_head_ptr = v_cache +
+                                            block_elem_num * block_index +
+                                            head_idx * block_size * head_size;
+
+          for (int src_key_idx = 0; src_key_idx < head_size; src_key_idx += x) {
+            const int64_t target_offset =
+                src_key_idx * block_size + block_offset * x;
+            for (int i = 0; i < x; ++i) {
+              target_key_head_ptr[target_offset + i] =
+                  src_key_head_ptr[src_key_idx + i];
+            }
+          }
+
+          for (int src_value_idx = 0; src_value_idx < head_size;
+               ++src_value_idx) {
+            const int64_t target_offset =
+                src_value_idx * block_size + block_offset;
+            target_value_head_ptr[target_offset] =
+                src_value_head_ptr[src_value_idx];
+          }
+        }
+      }
+    }
+
+    constexpr int xx = 16 / sizeof(scalar_t);
+    const int num_queries_per_kv = num_heads / num_kv_heads;
+
+    static_assert(BLOCK_SIZE == 16);
+
+    int max_seq_len = max_num_blocks_per_seq * BLOCK_SIZE;
+    int max_seq_len_padded = (max_seq_len + 15) & 0xFFFFFFF0;
+    TORCH_CHECK((max_seq_len_padded * sizeof(float)) % 64 == 0);
+
+    const int parallel_work_item_num = omp_get_max_threads();
+
+    size_t logits_bytes =
+        parallel_work_item_num * max_seq_len_padded * sizeof(float);
+    float* logits = (float*)std::aligned_alloc(
+        64, logits_bytes);  // Cacheline alignment for each context token.
+                            // [parallel_work_item_num, max_seq_len_padded]
+
+#pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
+        int seq_len = seq_lens[seq_idx];
+        const int* seq_block_table =
+            block_tables + max_num_blocks_per_seq * seq_idx;
+        const int block_num = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        const int64_t kv_head_idx = head_idx / num_queries_per_kv;
+        const scalar_t* __restrict__ q_vec_ptr =
+            q + seq_idx * q_stride + head_idx * HEAD_SIZE;
+        const int last_block_token_num = seq_len - (block_num - 1) * BLOCK_SIZE;
+        float* __restrict__ thread_block_logits =
+            logits + omp_get_thread_num() * max_seq_len_padded;
+
+        // Compute logits
+        for (int block_idx = 0; block_idx < block_num; ++block_idx) {
+          const int64_t physical_block_idx = seq_block_table[block_idx];
+          const scalar_t* __restrict__ k_block_cache_ptr =
+              k_cache + physical_block_idx * kv_block_stride +
+              kv_head_idx * kv_head_stride;
+          float* __restrict__ head_block_logits =
+              thread_block_logits + block_idx * BLOCK_SIZE;
+
+          reduceQKBlockKernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, xx>::call(
+              q_vec_ptr, k_block_cache_ptr, head_block_logits, scale,
+              block_idx == block_num - 1 ? last_block_token_num : BLOCK_SIZE);
+        }
+
+        // Compute softmax
+        if (alibi_slopes) {
+          reduceSoftmaxAlibi(thread_block_logits, seq_len,
+                             block_num * BLOCK_SIZE, alibi_slopes[head_idx], 0,
+                             seq_len);
+        } else {
+          reduceSoftmax(thread_block_logits, seq_len, block_num * BLOCK_SIZE);
+        }
+
+        // Compute value
+        constexpr int head_elem_num_per_partition = 16;
+        constexpr int head_partition_num =
+            HEAD_SIZE / head_elem_num_per_partition;
+        for (int head_part_idx = 0; head_part_idx < head_partition_num;
+             ++head_part_idx) {
+          vec_op::FP32Vec16 accums[head_elem_num_per_partition];
+          scalar_t* __restrict__ out_ptr =
+              out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
+              head_part_idx * head_elem_num_per_partition;
+          for (int block_idx = 0; block_idx < block_num; ++block_idx) {
+            const int64_t physical_block_idx = seq_block_table[block_idx];
+            const float* __restrict__ prob_vec_ptr =
+                thread_block_logits + block_idx * BLOCK_SIZE;
+            const scalar_t* __restrict__ v_block_cache_ptr =
+                v_cache + physical_block_idx * kv_block_stride +
+                kv_head_idx * kv_head_stride +
+                BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
+            reduceValueBlock<scalar_t, HEAD_SIZE, BLOCK_SIZE,
+                             head_elem_num_per_partition>(
+                prob_vec_ptr, v_block_cache_ptr, accums);
+
+            if (block_idx != block_num - 1) {
+              const int64_t next_physical_block_idx =
+                  seq_block_table[block_idx + 1];
+              const scalar_t* __restrict__ next_v_block_cache_ptr =
+                  v_cache + next_physical_block_idx * kv_block_stride +
+                  kv_head_idx * kv_head_stride +
+                  BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
+              vec_op::unroll_loop<int, head_elem_num_per_partition>(
+                  [&](int head_elem_idx) {
+                    if (head_elem_idx % 2 == 0) {
+                      vec_op::prefetch(next_v_block_cache_ptr +
+                                       BLOCK_SIZE * head_elem_idx);
+                    }
+                  });
+            }
+          }
+
+          vec_op::unroll_loop<int, head_elem_num_per_partition>(
+              [&](int head_elem_idx) {
+                float value = accums[head_elem_idx].reduce_sum();
+                vec_op::storeFP32(value, out_ptr + head_elem_idx);
+              });
+        }
+      }
+    }
+    std::free(logits);
+  }
+};
+
+#define LAUNCH_CACHE_AND_DECODE_KERNEL(T, HEAD_SIZE, BLOCK_SIZE)             \
+  cache_and_decode_impl<T, HEAD_SIZE, BLOCK_SIZE>::call(                     \
+      out_ptr, query_ptr, key_ptr, value_ptr, slot_mapping_ptr, num_tokens,  \
+      key_stride, value_stride, num_heads, head_size, block_size, x,         \
+      key_cache_ptr, value_cache_ptr, num_kv_heads, scale, block_tables_ptr, \
+      seq_lens_ptr, max_num_blocks_per_seq, alibi_slopes_ptr, q_stride,      \
+      kv_block_stride, kv_head_stride, num_seqs);
+
+template <typename T, int BLOCK_SIZE>
+void cache_and_decode_impl_launcher(
+    torch::Tensor& out, torch::Tensor& query, torch::Tensor& key,
+    torch::Tensor& value, torch::Tensor& slot_mapping, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, int num_kv_heads, float scale,
+    torch::Tensor& block_tables, torch::Tensor& seq_lens, int max_seq_len,
+    const c10::optional<torch::Tensor>& alibi_slopes) {
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(3);
+  int x = key_cache.size(4);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+  int num_seqs = query.size(0);
+  // int num_heads = query.size(1);
+  // int head_size = query.size(2);
+  int max_num_blocks_per_seq = block_tables.size(1);
+  int q_stride = query.stride(0);
+  int kv_block_stride = key_cache.stride(0);
+  int kv_head_stride = key_cache.stride(1);
+
+  // NOTE: alibi_slopes is optional.
+  const float* alibi_slopes_ptr =
+      alibi_slopes
+          ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          : nullptr;
+
+  T* out_ptr = reinterpret_cast<T*>(out.data_ptr());
+  T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
+  T* key_ptr = reinterpret_cast<T*>(key.data_ptr());
+  T* value_ptr = reinterpret_cast<T*>(value.data_ptr());
+
+  T* key_cache_ptr = reinterpret_cast<T*>(key_cache.data_ptr());
+  T* value_cache_ptr = reinterpret_cast<T*>(value_cache.data_ptr());
+  int* block_tables_ptr = block_tables.data_ptr<int>();
+  int* seq_lens_ptr = seq_lens.data_ptr<int>();
+  int64_t* slot_mapping_ptr = slot_mapping.data_ptr<int64_t>();
+
+  switch (head_size) {
+    case 64:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 64, BLOCK_SIZE);
+      break;
+    case 80:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 80, BLOCK_SIZE);
+      break;
+    case 96:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 96, BLOCK_SIZE);
+      break;
+    case 112:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 112, BLOCK_SIZE);
+      break;
+    case 128:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 128, BLOCK_SIZE);
+      break;
+    case 192:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 192, BLOCK_SIZE);
+      break;
+    case 256:
+      LAUNCH_CACHE_AND_DECODE_KERNEL(T, 256, BLOCK_SIZE);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size: ", head_size);
+      break;
+  }
+}
+
+#define CALL_CACHE_AND_DECODE_LAUNCHER(T, BLOCK_SIZE)               \
+  cache_and_decode_impl_launcher<T, BLOCK_SIZE>(                    \
+      out, query, key, value, slot_mapping, key_cache, value_cache, \
+      num_kv_heads, scale, block_tables, seq_lens, max_seq_len, alibi_slopes);
+
+#define CALL_CACHE_AND_DECODE_LAUNCHER_BLOCK_SIZE(T)              \
+  switch (block_size) {                                           \
+    case 16:                                                      \
+      CALL_CACHE_AND_DECODE_LAUNCHER(T, 16);                      \
+      break;                                                      \
+    default:                                                      \
+      TORCH_CHECK(false, "Unsupported block size: ", block_size); \
+      break;                                                      \
+  }
+}  // namespace
+
+void cache_and_decode(
+    torch::Tensor& out, torch::Tensor& query, torch::Tensor& key,
+    torch::Tensor& value, torch::Tensor& slot_mapping, torch::Tensor& key_cache,
+    torch::Tensor& value_cache, int64_t num_kv_heads, double scale,
+    torch::Tensor& block_tables, torch::Tensor& seq_lens, int64_t block_size,
+    int64_t max_seq_len, const c10::optional<torch::Tensor>& alibi_slopes,
+    const std::string& kv_cache_dtype, double k_scale, double v_scale,
+    const int64_t tp_rank, const int64_t blocksparse_local_blocks,
+    const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
+    const int64_t blocksparse_head_sliding_step) {
+  TORCH_CHECK(k_scale == 1.0f && v_scale == 1.0f);
+  TORCH_CHECK(blocksparse_vert_stride <= 1,
+              "CPU backend does not support blocksparse attention yet.");
+
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  //  int block_size = key_cache.size(3);
+  int x = key_cache.size(4);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  VLLM_DISPATCH_FLOATING_TYPES(key.scalar_type(), "cache_and_decode_impl", [&] {
+    CPU_KERNEL_GUARD_IN(cache_and_decode_impl)
+    CALL_CACHE_AND_DECODE_LAUNCHER_BLOCK_SIZE(scalar_t);
+    CPU_KERNEL_GUARD_OUT(cache_and_decode_impl)
+  });
+}

@@ -12,6 +12,9 @@ from vllm.attention.backends.utils import CommonAttentionState
 from vllm.attention.ops.paged_attn import PagedAttentionMetadata
 from vllm.platforms import current_platform
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
 if current_platform.is_cpu():
     try:
         from vllm.attention.ops.ipex_attn import PagedAttention
@@ -288,6 +291,11 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
     ) -> None:
+        logger.info("schan: TorchSDPABackendImpl")
+        logger.info("num_heads: %d", num_heads)
+        logger.info("head_size: %d", head_size)
+        logger.info("num_kv_heads: %d", num_kv_heads)
+
         if blocksparse_params is not None:
             raise ValueError(
                 "Torch SPDA does not support block-sparse attention.")
@@ -318,6 +326,15 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                 "Torch SDPA backend does not support FP8 KV cache. "
                 "Please use xFormers backend instead.")
 
+    def count_calls(func):
+        def wrapper(*args, **kwargs):
+            wrapper.call_count += 1
+            return func(*args, **kwargs)
+
+        wrapper.call_count = 0
+        return wrapper
+
+    @count_calls
     def forward(
         self,
         query: torch.Tensor,
@@ -342,6 +359,13 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        logger.info(f"query [num_tokens, num_heads * head_size]    : {query.shape}")
+        logger.info(f"key   [num_tokens, num_kv_heads * head_size] : {key.shape}")
+        logger.info(f"value [num_tokens, num_kv_heads * head_size] : {value.shape}")
+        logger.info(f"kv_cache [2, num_blocks, block_size * num_kv_heads * head_size] : {kv_cache.shape}")
+        logger.info("block_size : %d", (kv_cache.shape[2] / key.shape[1]))
+        logger.info(f"forward called : {TorchSDPABackendImpl.forward.call_count}")
+
         assert k_scale == 1.0 and v_scale == 1.0
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
@@ -362,7 +386,14 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         else:
             assert value is None
 
-        if (attn_type != AttentionType.ENCODER and kv_cache.numel() > 0):
+        logger.info(f"attn_type: {attn_type}")
+        logger.info(f"kv_cache.numel(): {kv_cache.numel()}")
+        if (attn_metadata.prefill_metadata != None):
+            logger.info("prefill meta is not none")
+        if (attn_metadata.decode_metadata != None):
+            logger.info("decode meta is not none")
+
+        if (attn_type != AttentionType.ENCODER and kv_cache.numel() > 0 and attn_metadata.prefill_metadata != None):
             # KV-cache during decoder-self- or
             # encoder-decoder-cross-attention, but not
             # during encoder attention.
@@ -372,6 +403,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
             # i.e. for later use by paged attention
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
+            logger.info(f"key_cache : {key_cache.shape}")
+            logger.info(f"value_cache : {value_cache.shape}")
 
             if (key is not None) and (value is not None):
                 if attn_type == AttentionType.ENCODER_DECODER:
@@ -382,6 +415,8 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
                 else:
                     # Update self-attention KV cache (prefill/decode)
                     updated_slot_mapping = attn_metadata.slot_mapping
+                    logger.info(f"slot_mapping shape  : {updated_slot_mapping.shape}")
+                    logger.info(f"slot_mapping : {updated_slot_mapping}")
 
                 PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                     value_cache,
@@ -426,29 +461,52 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         if decode_meta := attn_metadata.decode_metadata:
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
-            # Decoding run.
-            (
-                seq_lens_arg,
-                max_seq_len_arg,
-                block_tables_arg,
-            ) = decode_meta.get_seq_len_block_table_args(attn_type)
 
-            output = PagedAttention.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                block_tables_arg,
-                seq_lens_arg,
-                max_seq_len_arg,
-                self.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                k_scale,
-                v_scale,
-            )
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size)
 
-        # Reshape the output tensor.
+            if (key is not None) and (value is not None):
+                if attn_type == AttentionType.ENCODER_DECODER:
+                    # Update cross-attention KV cache (prefill-only)
+                    # During cross-attention decode, key & value will be None,
+                    # preventing this IF-statement branch from running
+                    updated_slot_mapping = attn_metadata.cross_slot_mapping
+                else:
+                    # Update self-attention KV cache (prefill/decode)
+                    updated_slot_mapping = attn_metadata.slot_mapping
+
+                # Decoding run.
+                (
+                    seq_lens_arg,
+                    max_seq_len_arg,
+                    block_tables_arg,
+                ) = decode_meta.get_seq_len_block_table_args(attn_type)
+                output = PagedAttention.cache_and_decode(
+                    key, value, query, key_cache, value_cache, updated_slot_mapping, block_tables_arg,
+                    seq_lens_arg, max_seq_len_arg, self.kv_cache_dtype, self.num_kv_heads, self.scale,
+                    self.alibi_slopes, k_scale, v_scale)
+            # (
+            #     seq_lens_arg,
+            #     max_seq_len_arg,
+            #     block_tables_arg,
+            # ) = decode_meta.get_seq_len_block_table_args(attn_type)
+
+            # output = PagedAttention.forward_decode(
+            #     query,
+            #     key_cache,
+            #     value_cache,
+            #     block_tables_arg,
+            #     seq_lens_arg,
+            #     max_seq_len_arg,
+            #     self.kv_cache_dtype,
+            #     self.num_kv_heads,
+            #     self.scale,
+            #     self.alibi_slopes,
+            #     k_scale,
+            #     v_scale,
+            # )
+
+            # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
     def _run_sdpa_forward(
